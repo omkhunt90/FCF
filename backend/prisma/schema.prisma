@@ -1,0 +1,320 @@
+// This is the Prisma schema for Fastest Coder First (FCF)
+// Competition platform for SciClone Engineer's Day
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum Role {
+  PARTICIPANT
+  ADMIN
+}
+
+enum CompetitionStatus {
+  NOT_STARTED
+  READY
+  RUNNING
+  PAUSED
+  COMPLETED
+}
+
+enum RoundStatus {
+  UPCOMING
+  ACTIVE
+  PAUSED
+  ENDED
+}
+
+enum ActivityType {
+  DUMB_CHARADES
+  BLIND_CODING
+  CODE_DEBUGGING
+  CODING_SPRINT
+  FUTURE_ACTIVITY
+}
+
+enum SubmissionStatus {
+  PENDING
+  COMPILING
+  ACCEPTED
+  WRONG_ANSWER
+  COMPILE_ERROR
+  RUNTIME_ERROR
+  TIME_LIMIT_EXCEEDED
+  MEMORY_LIMIT_EXCEEDED
+  SYSTEM_ERROR
+}
+
+enum AuditEventType {
+  TAB_SWITCH
+  FOCUS_LOSS
+  FOCUS_LOST
+  FULLSCREEN_EXIT
+  FULLSCREEN_ENTER
+  ROUND_ENTER
+  ROUND_EXIT
+  SUBMISSION_ATTEMPT
+  SUBMISSION_CORRECT
+  PAGE_RELOAD
+  SUSPICIOUS_ACTIVITY
+  ACTIVITY_STARTED
+  ACTIVITY_ENDED
+}
+
+// ---------------------------------------------------------------------------
+// Users — both roles
+// ---------------------------------------------------------------------------
+
+model User {
+  id           String      @id @default(cuid())
+  username     String      @unique
+  passwordHash String
+  role         Role        @default(PARTICIPANT)
+  isActive     Boolean     @default(true)
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+  participant  Participant?
+}
+
+// ---------------------------------------------------------------------------
+// Participant profile
+// ---------------------------------------------------------------------------
+
+model Participant {
+  id                    String                     @id @default(cuid())
+  userId                String                     @unique
+  user                  User                       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  displayName           String
+  teamName              String?
+  isActive              Boolean                    @default(true)
+  assignedQuestionBank  Int?                       // 1, 2, or 3 — Dumb Charades bank assigned by admin
+  createdAt             DateTime                   @default(now())
+  updatedAt             DateTime                   @updatedAt
+  submissions           Submission[]
+  sessions              ParticipantSession[]
+  auditEvents           AuditEvent[]
+  leaderboardEntry      LeaderboardEntry?
+  activitySessions      ParticipantActivitySession[]
+
+  @@index([userId])
+}
+
+// ---------------------------------------------------------------------------
+// Competition — singleton (one active competition at a time)
+// ---------------------------------------------------------------------------
+
+model Competition {
+  id             String            @id @default(cuid())
+  name           String
+  status         CompetitionStatus @default(NOT_STARTED)
+  startedAt      DateTime?
+  endedAt        DateTime?
+  currentRoundId String?
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+  rounds         Round[]
+}
+
+// ---------------------------------------------------------------------------
+// Rounds — extensible, data-driven
+// ---------------------------------------------------------------------------
+
+model Round {
+  id               String      @id @default(cuid())
+  competitionId    String
+  competition      Competition @relation(fields: [competitionId], references: [id])
+  name             String
+  roundNumber      Int
+  durationMs       Int         // total round duration
+  status           RoundStatus @default(UPCOMING)
+  startedAt        DateTime?
+  endedAt          DateTime?
+  pausedRemainingMs Int?       // remaining ms saved when paused — for restoring after server restart
+  activeActivityId String?     // which activity is currently selected
+  createdAt        DateTime    @default(now())
+  updatedAt        DateTime    @updatedAt
+  activities       Activity[]
+  submissions      Submission[]
+
+  @@unique([competitionId, roundNumber])
+  @@index([competitionId])
+}
+
+// ---------------------------------------------------------------------------
+// Activities — type-driven, config stored as JSON for extensibility
+// ---------------------------------------------------------------------------
+
+model Activity {
+  id               String                     @id @default(cuid())
+  roundId          String
+  round            Round                      @relation(fields: [roundId], references: [id])
+  name             String
+  type             ActivityType
+  config           Json                       @default("{}") // activity-specific config (extensible)
+  isActive         Boolean                    @default(false)
+  durationMs       Int?                       // per-activity duration (15 min = 900000)
+  createdAt        DateTime                   @default(now())
+  updatedAt        DateTime                   @updatedAt
+  tasks            Task[]
+  activitySessions ParticipantActivitySession[]
+
+  @@index([roundId])
+}
+
+// ---------------------------------------------------------------------------
+// Tasks — questions/challenges (answer is backend-only)
+// ---------------------------------------------------------------------------
+
+model Task {
+  id             String       @id @default(cuid())
+  activityId     String
+  activity       Activity     @relation(fields: [activityId], references: [id])
+  title          String
+  description    String       // shown to participant
+  // SECURITY: correctAnswer MUST never be included in any client-facing API response
+  correctAnswer  String?      // stored lowercase; backend comparison only
+  inputSpec      String?      // stdin fed to participant's program (if any)
+  sampleOutput   String?      // example output hint shown to participant (NOT the answer)
+  timeoutMs      Int          @default(2000)
+  memoryLimitMb  Int          @default(64)
+  points         Int          @default(10)
+  maxAttempts    Int?         // null = unlimited
+  orderIndex     Int          @default(0)  // display/solve order
+  questionBank   Int?         // 1, 2, or 3 — Dumb Charades question bank (null = all activities)
+  starterCode    String?      // CODE_DEBUGGING: pre-filled buggy code shown to participant in editor
+  config         Json?        // CODE_DEBUGGING: error definitions [{id, description, fixRegex}]
+  isActive       Boolean      @default(true)
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  submissions    Submission[]
+
+  @@index([activityId, orderIndex])
+  @@index([activityId, questionBank])
+}
+
+// ---------------------------------------------------------------------------
+// Submissions — every compile/run/submit attempt
+// ---------------------------------------------------------------------------
+
+model Submission {
+  id              String           @id @default(cuid())
+  participantId   String
+  participant     Participant      @relation(fields: [participantId], references: [id])
+  roundId         String
+  round           Round            @relation(fields: [roundId], references: [id])
+  taskId          String?
+  task            Task?            @relation(fields: [taskId], references: [id])
+  attemptNumber   Int              @default(1)  // nth attempt for this participant+task
+  sourceCode      String
+  language        String           @default("c")
+  status          SubmissionStatus @default(PENDING)
+  isCorrect       Boolean          @default(false)
+  compileError    String?
+  // SECURITY: stdout stored backend-only; never returned to participant if it reveals answer
+  stdout          String?
+  stderr          String?
+  executionTimeMs Int?
+  score           Int?             // points awarded: 0 or task.points
+  submittedAt     DateTime         @default(now())
+  // SECURITY: full compiler response stored for admin view only
+  compilerResult  Json?
+
+  @@index([participantId, taskId])
+  @@index([roundId])
+  @@index([submittedAt])
+}
+
+// ---------------------------------------------------------------------------
+// Participant sessions — state restore on browser refresh
+// ---------------------------------------------------------------------------
+
+model ParticipantSession {
+  id            String      @id @default(cuid())
+  participantId String
+  participant   Participant @relation(fields: [participantId], references: [id], onDelete: Cascade)
+  roundId       String?
+  currentCode   String?     // last saved editor content
+  lastSeenAt    DateTime    @default(now())
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+
+  @@unique([participantId, roundId])
+  @@index([participantId])
+}
+
+// ---------------------------------------------------------------------------
+// Per-participant activity sessions — tracks when each participant starts an activity
+// ---------------------------------------------------------------------------
+
+model ParticipantActivitySession {
+  id            String      @id @default(cuid())
+  participantId String
+  participant   Participant @relation(fields: [participantId], references: [id], onDelete: Cascade)
+  activityId    String
+  activity      Activity    @relation(fields: [activityId], references: [id])
+  startedAt     DateTime    @default(now())
+  endedAt       DateTime?   // set when activity timer expires or participant finishes
+  createdAt     DateTime    @default(now())
+
+  @@unique([participantId, activityId])
+  @@index([participantId])
+  @@index([activityId])
+}
+
+// ---------------------------------------------------------------------------
+// Audit events — tab switches, focus loss, suspicious activity
+// ---------------------------------------------------------------------------
+
+model AuditEvent {
+  id            String         @id @default(cuid())
+  participantId String
+  participant   Participant    @relation(fields: [participantId], references: [id])
+  eventType     AuditEventType
+  metadata      Json?          // event-specific data (e.g. tab count, duration)
+  occurredAt    DateTime       @default(now())
+
+  @@index([participantId])
+  @@index([occurredAt])
+}
+
+// ---------------------------------------------------------------------------
+// Leaderboard — aggregated scores per participant
+// ---------------------------------------------------------------------------
+
+model LeaderboardEntry {
+  id               String      @id @default(cuid())
+  participantId    String      @unique
+  participant      Participant @relation(fields: [participantId], references: [id])
+  totalScore       Int         @default(0)
+  totalSubmissions Int         @default(0)
+  acceptedCount    Int         @default(0)
+  lastAcceptedAt   DateTime?
+  rank             Int?
+  updatedAt        DateTime    @updatedAt
+
+  @@index([totalScore, lastAcceptedAt])
+}
+
+// ---------------------------------------------------------------------------
+// Token blacklist — for secure logout (revoked refresh tokens)
+// ---------------------------------------------------------------------------
+
+model TokenBlacklist {
+  id        String   @id @default(cuid())
+  token     String   @unique
+  userId    String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([token])
+  @@index([expiresAt])
+}
