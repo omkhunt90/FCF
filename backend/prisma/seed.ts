@@ -94,9 +94,9 @@ async function main() {
                     },
                   },
                   {
-                    name: 'Activity B (TBD)',
-                    type: 'FUTURE_ACTIVITY',
-                    config: { placeholder: true },
+                    name: 'Blind Coding',
+                    type: 'BLIND_CODING',
+                    config: { timeLimit: 900000 },
                   },
                 ],
               },
